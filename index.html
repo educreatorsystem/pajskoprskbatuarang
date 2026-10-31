@@ -1061,6 +1061,104 @@
             return '';
         }
 
+
+        // Cache data-URI gambar Drive supaya pratonton tema / PDF tidak perlu memuat turun semula.
+        const oprImageDataCache = new Map();
+
+        function extractDriveFileIdClient(value) {
+            if (!value) return '';
+            const text = String(value).trim();
+            if (/^[a-zA-Z0-9_-]{20,}$/.test(text)) return text;
+            const patterns = [
+                /\/d\/([a-zA-Z0-9_-]{20,})/,
+                /[?&]id=([a-zA-Z0-9_-]{20,})/,
+                /googleusercontent\.com\/d\/([a-zA-Z0-9_-]{20,})/
+            ];
+            for (const pattern of patterns) {
+                const match = text.match(pattern);
+                if (match) return match[1];
+            }
+            return '';
+        }
+
+        function getDirectImageSrc(img) {
+            const src = getImageSrc(img);
+            if (!src) return '';
+            const fileId = extractDriveFileIdClient(src);
+            // URL thumbnail Drive lebih stabil untuk <img> berbanding lh3 / uc lama.
+            if (fileId) return `https://drive.google.com/thumbnail?id=${encodeURIComponent(fileId)}&sz=w1600`;
+            return src;
+        }
+
+        async function fetchDriveImageDataUrl(fileId) {
+            if (!fileId) return '';
+            if (oprImageDataCache.has(fileId)) return oprImageDataCache.get(fileId);
+            const url = `${SCRIPT_URL}?action=getImageData&fileId=${encodeURIComponent(fileId)}&t=${Date.now()}`;
+            const response = await fetch(url, { method:'GET', cache:'no-store' });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const result = await response.json();
+            if (result.status !== 'success' || !result.dataUrl) {
+                throw new Error(result.message || 'Gambar Drive tidak dapat dibaca.');
+            }
+            oprImageDataCache.set(fileId, result.dataUrl);
+            return result.dataUrl;
+        }
+
+        async function oprImageFallback(img) {
+            if (!img || img.dataset.fallbackBusy === '1') return;
+            const fileId = img.dataset.driveFileId || extractDriveFileIdClient(img.dataset.originalSrc || img.src || '');
+            if (!fileId) return;
+            img.dataset.fallbackBusy = '1';
+            try {
+                const dataUrl = await fetchDriveImageDataUrl(fileId);
+                if (dataUrl) {
+                    img.src = dataUrl;
+                    img.dataset.embedded = '1';
+                    img.dataset.fallbackBusy = '0';
+                }
+            } catch (error) {
+                img.dataset.fallbackBusy = '0';
+                img.dataset.fallbackFailed = '1';
+                console.warn('Fallback gambar Drive gagal:', error);
+            }
+        }
+
+        function waitForImageElement(img, timeoutMs = 6000) {
+            if (!img) return Promise.resolve();
+            if (img.complete && img.naturalWidth > 0) return Promise.resolve();
+            return new Promise(resolve => {
+                let done = false;
+                const finish = () => {
+                    if (done) return;
+                    done = true;
+                    resolve();
+                };
+                img.addEventListener('load', finish, { once:true });
+                img.addEventListener('error', finish, { once:true });
+                setTimeout(finish, timeoutMs);
+            });
+        }
+
+        async function hydrateOPRDriveImages(root = document.getElementById('opr-live-sheet')) {
+            if (!root) return;
+            const imgs = Array.from(root.querySelectorAll('img[data-drive-file-id]'));
+            await Promise.all(imgs.map(async img => {
+                const fileId = img.dataset.driveFileId;
+                if (!fileId || img.dataset.embedded === '1') return;
+                try {
+                    const dataUrl = await fetchDriveImageDataUrl(fileId);
+                    if (dataUrl) {
+                        img.src = dataUrl;
+                        img.dataset.embedded = '1';
+                    }
+                } catch (error) {
+                    // Jika proxy gagal, biarkan URL thumbnail biasa mencuba memaparkan gambar.
+                    console.warn('Gambar kekal menggunakan URL terus:', error);
+                }
+            }));
+            await Promise.all(Array.from(root.querySelectorAll('img')).map(img => waitForImageElement(img)));
+        }
+
         function normalizeReport(rep) {
             const students = normalizeList(rep.students || rep.murid || rep.senaraiMurid);
             const teachers = normalizeList(rep.teachers || rep.guru || rep.senaraiGuru);
@@ -1713,7 +1811,13 @@ ANCAMAN/CABARAN (T):
             const boxes = [];
             for (let i = 0; i < 3; i++) {
                 if (images[i]) {
-                    boxes.push(`<div class="opr4-photo"><img src="${escapeHTML(getImageSrc(images[i]))}" crossorigin="anonymous" alt="Gambar program ${i + 1}"></div>`);
+                    const originalSrc = getImageSrc(images[i]);
+                    const displaySrc = getDirectImageSrc(images[i]);
+                    const fileId = extractDriveFileIdClient(originalSrc);
+                    const driveAttrs = fileId
+                        ? ` data-drive-file-id="${escapeHTML(fileId)}" data-original-src="${escapeHTML(originalSrc)}" onerror="oprImageFallback(this)"`
+                        : '';
+                    boxes.push(`<div class="opr4-photo"><img src="${escapeHTML(displaySrc)}"${driveAttrs} alt="Gambar program ${i + 1}"></div>`);
                 } else {
                     boxes.push('<div class="opr4-photo"><div class="opr4-photo-empty"><span>Tiada Gambar</span></div></div>');
                 }
@@ -1764,7 +1868,7 @@ ANCAMAN/CABARAN (T):
         function rainbowTemplate(rep) {
             const swot = parseSWOT(rep.swot);
             return `<div class="opr4-page">
-                <header class="opr4-hero"><img class="opr4-logo" src="${SCHOOL_LOGO}" crossorigin="anonymous" alt="Lencana Sekolah"><div class="opr4-school">${escapeHTML(SCHOOL_NAME)}</div><div class="opr4-theme-label">One Page Report • Kokurikulum</div><h1 class="opr4-title">${escapeHTML(rep.name)}</h1><i class="fa-solid fa-paper-plane opr4-deco-plane"></i></header>
+                <header class="opr4-hero"><img class="opr4-logo" src="${SCHOOL_LOGO}" alt="Lencana Sekolah"><div class="opr4-school">${escapeHTML(SCHOOL_NAME)}</div><div class="opr4-theme-label">One Page Report • Kokurikulum</div><h1 class="opr4-title">${escapeHTML(rep.name)}</h1><i class="fa-solid fa-paper-plane opr4-deco-plane"></i></header>
                 ${commonMetaHTML(rep)}
                 ${commonSectionsHTML(rep, swot)}
                 <div class="rainbow-footer"></div>
@@ -1774,7 +1878,7 @@ ANCAMAN/CABARAN (T):
         function corporateTemplate(rep) {
             const swot = parseSWOT(rep.swot);
             return `<div class="opr4-page">
-                <header class="opr4-hero"><div class="opr4-theme-label">One Page Report • PAJSK</div><h1 class="opr4-title">${escapeHTML(rep.name)}</h1><div class="opr4-school">${escapeHTML(SCHOOL_NAME)}</div><img class="opr4-logo" src="${SCHOOL_LOGO}" crossorigin="anonymous" alt="Lencana Sekolah"><i class="fa-solid fa-paper-plane opr4-deco-plane"></i></header>
+                <header class="opr4-hero"><div class="opr4-theme-label">One Page Report • PAJSK</div><h1 class="opr4-title">${escapeHTML(rep.name)}</h1><div class="opr4-school">${escapeHTML(SCHOOL_NAME)}</div><img class="opr4-logo" src="${SCHOOL_LOGO}" alt="Lencana Sekolah"><i class="fa-solid fa-paper-plane opr4-deco-plane"></i></header>
                 ${commonMetaHTML(rep)}
                 ${commonSectionsHTML(rep, swot)}
                 <div class="corporate-footer"></div>
@@ -1784,7 +1888,7 @@ ANCAMAN/CABARAN (T):
         function pastelTemplate(rep) {
             const swot = parseSWOT(rep.swot);
             return `<div class="opr4-page">
-                <header class="opr4-hero"><img class="opr4-logo" src="${SCHOOL_LOGO}" crossorigin="anonymous" alt="Lencana Sekolah"><div class="opr4-school">${escapeHTML(SCHOOL_NAME)}</div><div class="opr4-theme-label">Belajar • Berani • Berprestasi</div><h1 class="opr4-title">${escapeHTML(rep.name)}</h1><i class="fa-solid fa-paper-plane opr4-deco-plane"></i></header>
+                <header class="opr4-hero"><img class="opr4-logo" src="${SCHOOL_LOGO}" alt="Lencana Sekolah"><div class="opr4-school">${escapeHTML(SCHOOL_NAME)}</div><div class="opr4-theme-label">Belajar • Berani • Berprestasi</div><h1 class="opr4-title">${escapeHTML(rep.name)}</h1><i class="fa-solid fa-paper-plane opr4-deco-plane"></i></header>
                 ${commonMetaHTML(rep)}
                 ${commonSectionsHTML(rep, swot)}
                 <div class="pastel-footer"></div>
@@ -1794,7 +1898,7 @@ ANCAMAN/CABARAN (T):
         function magazineTemplate(rep) {
             const swot = parseSWOT(rep.swot);
             return `<div class="opr4-page">
-                <header class="opr4-hero"><div class="opr4-theme-label">Achievement Report • Kokurikulum</div><h1 class="opr4-title">${escapeHTML(rep.name)}</h1><div class="opr4-school">${escapeHTML(SCHOOL_NAME)}</div><img class="opr4-logo" src="${SCHOOL_LOGO}" crossorigin="anonymous" alt="Lencana Sekolah"><i class="fa-solid fa-paper-plane opr4-deco-plane"></i><div class="mag-achievement"><i class="fa-solid fa-trophy"></i><span>${escapeHTML(rep.achievement || 'Pencapaian')}</span></div></header>
+                <header class="opr4-hero"><div class="opr4-theme-label">Achievement Report • Kokurikulum</div><h1 class="opr4-title">${escapeHTML(rep.name)}</h1><div class="opr4-school">${escapeHTML(SCHOOL_NAME)}</div><img class="opr4-logo" src="${SCHOOL_LOGO}" alt="Lencana Sekolah"><i class="fa-solid fa-paper-plane opr4-deco-plane"></i><div class="mag-achievement"><i class="fa-solid fa-trophy"></i><span>${escapeHTML(rep.achievement || 'Pencapaian')}</span></div></header>
                 <div class="mag-content">
                     ${commonMetaHTML(rep)}
                     ${commonSectionsHTML(rep, swot)}
@@ -1825,6 +1929,8 @@ ANCAMAN/CABARAN (T):
             sheet.innerHTML = getOPRTemplateHTML(rep, theme);
             const themeSelect = document.getElementById('oprThemeSelect');
             if (themeSelect) themeSelect.value = theme;
+            // Tukar gambar Drive kepada data-URI melalui Apps Script supaya stabil untuk pratonton/PDF.
+            requestAnimationFrame(() => hydrateOPRDriveImages(sheet));
         }
 
         function selectOPRReport(reportId, shouldScroll = true) {
@@ -1906,7 +2012,7 @@ ANCAMAN/CABARAN (T):
             el.innerHTML = objectiveItems(value).map((item, idx) => `<span class="opr-objective-item">${idx + 1}. ${escapeHTML(item)}</span>`).join('');
         }
 
-        function printReport() {
+        async function printReport() {
             const source = document.getElementById('opr-live-sheet');
             if (!source || !activeOPRReportId) {
                 showToast('Sila pilih rekod OPR dahulu.', 'error');
@@ -1917,18 +2023,20 @@ ANCAMAN/CABARAN (T):
                 showToast('Pop-up cetakan disekat. Sila benarkan pop-up pada browser.', 'error');
                 return;
             }
+            await hydrateOPRDriveImages(source);
             const themeStyles = document.getElementById('opr-theme-styles')?.textContent || '';
             printWindow.document.write(`<!DOCTYPE html><html lang="ms"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OPR - ${escapeHTML(reportsData.find(r=>String(r.id)===String(activeOPRReportId))?.name || 'Laporan')}</title><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet"><style>body{margin:0;background:#fff;font-family:Inter,Arial,sans-serif}.opr-live-sheet{box-shadow:none!important;margin:0!important}${themeStyles}@page{size:A4 portrait;margin:0}@media print{html,body{margin:0!important;padding:0!important;-webkit-print-color-adjust:exact!important;print-color-adjust:exact!important}}</style></head><body>${source.outerHTML}<script>window.onload=()=>setTimeout(()=>window.print(),350);<\/script></body></html>`);
             printWindow.document.close();
         }
 
-        function downloadPDF() {
+        async function downloadPDF() {
             const element = document.getElementById('opr-live-sheet');
             const rep = reportsData.find(r => String(r.id) === String(activeOPRReportId));
             if (!element || !rep) {
                 showToast('Sila pilih rekod OPR dahulu.', 'error');
                 return;
             }
+            await hydrateOPRDriveImages(element);
             const safeName = (rep.name || 'Laporan_OPR').replace(/[^a-z0-9]+/gi, '_').replace(/^_|_$/g, '');
             const oldShadow = element.style.boxShadow;
             element.style.boxShadow = 'none';
